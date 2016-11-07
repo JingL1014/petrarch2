@@ -4,6 +4,8 @@
 import networkx as nx
 import PETRglobals
 import PETRreader
+import logging
+
 
 class NounPhrase:
 
@@ -16,11 +18,16 @@ class NounPhrase:
 		self.meaning = ""
 		self.date = date
 		self.sentence = sentence
+		self.matched_txt = None
 
 	def get_meaning(self):
 		npText = self.text.upper().split(" ")
 		# matching the entire noun phrase string first in the actor or agent dictionary
 		codes,roots,matched_txt = self.textMatching(npText)
+
+		actorcodes, agentcodes = self.resolve_codes(codes)
+		self.meaning = self.mix_codes(agentcodes, actorcodes)
+		self.matched_txt = matched_txt
 
 		return codes,roots,matched_txt
 
@@ -31,6 +38,7 @@ class NounPhrase:
 
 		index = 0
 		while index < len(npText):
+		    print(npText[index:])
 		    match = self.code_extraction(PETRglobals.ActorDict, npText[index:], 0)  # checking for actors
 		    if match:
 		        # --                print('NPgm-m-1:',match)
@@ -78,6 +86,84 @@ class NounPhrase:
 		        # 16.04.25 this branch always resolves to an agent
 		        return [path['#']], so_far, length
 		return False
+
+	def resolve_codes(self, codes):
+		"""
+		Method that divides a list of mixed codes into actor and agent codes
+
+		Parameters
+		-----------
+		codes: list
+		       Mixed list of codes
+
+		Returns
+		-------
+		actorcodes: list
+		            List of actor codes
+
+		agentcodes: list
+		            List of actor codes
+
+		"""
+		if not codes:
+			return [], []
+
+		actorcodes = []
+		agentcodes = []
+		for code in codes:
+			if not code:
+			    continue
+			if code.startswith("~"):
+				agentcodes.append(code)
+			else:
+				actorcodes.append(code)
+		return actorcodes, agentcodes
+
+	def mix_codes(self, agents, actors):
+		"""
+		Combine the actor codes and agent codes addressing duplicates
+		and removing the general "~PPL" if there's a better option.
+
+		Parameters
+		-----------
+		agents, actors : Lists of their respective codes
+
+
+		Returns
+		-------
+		codes: list
+		       [Agent codes] x [Actor codes]
+
+		"""
+
+		# --        print('mc-entry',actors,agents)
+		codes = set()
+		mix = lambda a, b: a + b if not b in a else a
+		actors = actors if actors else ['~']
+		for ag in agents:
+			if ag == '~PPL' and len(agents) > 1:
+				continue
+		#            actors = map( lambda a : mix( a[0], ag[1:]), actors)
+			actors = map(lambda a: mix(a, ag[1:]), actors)
+
+		# --        print('mc-1',actors)
+		return filter(lambda a: a not in ['', '~', '~~', None], actors)
+
+		# 16.04.25 hmmm, this is either a construct of utterly phenomenal
+		# subtlety or else we never hit this code...
+		codes = set()
+		# --        print('WTF-1')
+		for act in (actors if actors else ['~']):
+			for ag in (agents if agents else ['~']):
+				if ag == "~PPL" and len(agents) > 1:
+					continue
+				code = act
+				if not ag[1:] in act:
+					code += ag[1:]
+				if not code in ['~', '~~', ""]:
+					codes.add(code)
+		return list(codes)
+
 
 	def check_date(self,match):
 		"""
@@ -186,10 +272,27 @@ class NounPhrase:
 
 		return code
 
+class VerbPhrase:
+
+	def __init__(self,sentence,vpIDs,headID):
+
+		self.vpIDs = vpIDs
+		self.text = ""
+		self.head = None
+		self.headID = headID
+		self.meaning = ""
+		self.sentence = sentence
+		self.code = None
+		self.passive = False
+
+
+
+
 class Sentence:
 	"""
-    Holds the information of a sentence and its tree.
+    Holds the information of a sentence and its dependency tree.
     
+
     Methods
     -------
     
@@ -199,17 +302,47 @@ class Sentence:
 	"""
 
 	def __init__(self, parse, text, date):
+		"""
+        Initialization for Sentence classes.
+
+
+        Parameters
+        -----------
+
+        parse: string
+               parse tree read from input file
+
+        date: string
+        verbs: dictionary
+               verb phrases in the sentence
+               key is the headID in the dependency parse tree graph, value is a VerbPhrase object
+        nouns: dictionary
+               noun phrases in the sentence
+               key is the headID in the dependency parse tree graph, value is a NounPhrase object
+        
+        udgraph: graph
+        		 store denpendency parse tree as a graph
+
+
+        Returns
+        -------
+        An instantiated Sentence object
+
+        """
 		self.parse = parse
-		self.agent = ""
+		#self.agent = ""
 		self.ID = -1
-		self.actor = ""
+		#self.actor = ""
 		self.date = date
 		self.longlat = (-1,-1)
-		self.verbs = []
+		self.verbs = {}
+		self.nouns = {}
+		self.triplets = {}
+		self.rootID = ""
 		self.txt = ""
 		self.udgraph = self.str_to_graph(parse)
-		self.verb_analysis = {}
-		self.events = []
+		#self.verb_analysis = {}
+		self.events = {}
 		self.metadata = {'nouns': [], 'verbs':[],'triplets':[]}
     
 
@@ -228,14 +361,22 @@ class Sentence:
 
 		return dpgraph
 
+	def get_rootNode(self):
+		for successor in self.udgraph.successors(0):
+			if('relation' in self.udgraph[0][successor]):
+				#print(self.udgraph[nodeID][successor]['relation'])
+				if self.udgraph[0][successor]['relation'] in ['root']:
+					self.rootID = successor
 
 	def get_nounPharse(self, nounhead):
+		logger = logging.getLogger('petr_log.getNP')
 		npIDs=[]
 		if(self.udgraph.node[nounhead]['pos'] in ['NOUN','ADJ','PROPN']):
 			allsuccessors = nx.dfs_successors(self.udgraph,nounhead)
 
 			flag = True
 			parents = [nounhead]
+			prep_phrase = []
 			
 			while len(parents)>0:
 				temp = []
@@ -246,6 +387,22 @@ class Sentence:
 							if parent!=nounhead or self.udgraph[parent][child]['relation'] not in ['cc','conj']:
 								npIDs.append(child)
 								temp.append(child)
+							if parent==nounhead and self.udgraph[nounhead][child]['relation'] in ['nmod']:
+								# extract prepositional phrases in a noun phrase
+								#logger.debug(self.udgraph[nounhead][child]['relation'])
+								#logger.debug(self.udgraph.node[nounhead])
+								nmod_successors = nx.dfs_successors(self.udgraph,child)
+								
+								pptemp = []
+								pptemp.append(child)
+								for key in nmod_successors.keys():
+									pptemp.extend(nmod_successors[key]) 
+								pptemp.sort()
+								logger.debug(pptemp)
+								if self.udgraph.node[pptemp[0]]['pos'] in ['ADP']:
+
+									prep_phrase.append(pptemp)
+
 				parents = temp
 			
 			'''
@@ -262,7 +419,7 @@ class Sentence:
 		npIDs.append(nounhead)
 		npTokens =[]
 		npIDs.sort()
-		print(npIDs)
+		#print(npIDs)
 		if self.udgraph.node[npIDs[0]]['pos']=='ADP':
 			npIDs = npIDs[1:]
 		for npID in npIDs:
@@ -272,7 +429,38 @@ class Sentence:
 
 		np = NounPhrase(self,npIDs,nounhead,self.date)
 		np.text = nounPhrasetext
+		np.head = self.udgraph.node[nounhead]['token']
+
+		logger.debug("noun:"+nounPhrasetext)
+		for pp in prep_phrase:
+			ppTokens = []
+			for ppID in pp:
+				ppTokens.append(self.udgraph.node[ppID]['token'])
+
+			pptext = (' ').join(ppTokens)
+			logger.debug(pptext)
+
 		return np
+
+	def get_verbPhrase(self,verbhead):
+
+		vpIDs = []
+		for successor in self.udgraph.successors(verbhead):
+			if('relation' in self.udgraph[verbhead][successor]):
+				#print(self.udgraph[nodeID][successor]['relation'])
+				if self.udgraph[verbhead][successor]['relation'].startswith('compound'):
+					vpIDs.append(successor)
+		vpIDs.append(verbhead)
+		vpTokens =[]
+		vpIDs.sort()
+		for vpID in vpIDs:
+			vpTokens.append(self.udgraph.node[vpID]['token'])
+
+		verbPhrasetext = (' ').join(vpTokens)
+		vp = VerbPhrase(self,vpIDs,verbhead)
+		vp.text = verbPhrasetext
+		vp.head = self.udgraph.node[verbhead]['token']
+		return vp
 
 
 
@@ -283,9 +471,9 @@ class Sentence:
 		target = []
 		othernoun = []
 		for successor in self.udgraph.successors(nodeID):
-			print(str(nodeID)+"\t"+str(successor)+"\t"+self.udgraph.node[successor]['pos'])
+			#print(str(nodeID)+"\t"+str(successor)+"\t"+self.udgraph.node[successor]['pos'])
 			if('relation' in self.udgraph[nodeID][successor]):
-				print(self.udgraph[nodeID][successor]['relation'])
+				#print(self.udgraph[nodeID][successor]['relation'])
 				if(self.udgraph[nodeID][successor]['relation']=='nsubj'):
 					#source.append(self.udgraph.node[successor]['token'])
 					source.append(self.get_nounPharse(successor))
@@ -317,18 +505,42 @@ class Sentence:
 			nodeID = node[0]
 			attrs = node[1]
 			if 'pos' in attrs and attrs['pos']== 'VERB':
-				print(str(nodeID)+"\t"+attrs['pos']+"\t"+(" ").join(str(e) for e in self.udgraph.successors(nodeID)))
+				#print(str(nodeID)+"\t"+attrs['pos']+"\t"+(" ").join(str(e) for e in self.udgraph.successors(nodeID)))
 				#print(self.udgraph.successors(nodeID))
-				
-				verb = attrs['token']
+				verb = self.get_verbPhrase(nodeID)
+
+				if verb.headID in self.verbs:
+					raw_input("verb:"+self.verbs[verb.headID])
+				else:
+					self.verbs[verb.headID] = verb
+
 				source,target,othernoun = self.get_source_target(nodeID)
 
-				#for s in source: print(s)
+				for s in source:
+					if s.headID in self.nouns:
+						raw_input("source:"+self.nouns[s.headID])
+					else:
+						self.nouns[s.headID] = s
+
+				for t in target:
+					if t.headID in self.nouns:
+						raw_input("target:"+self.nouns[t.headID])
+					else:
+						self.nouns[t.headID] = t
+
+				for o in othernoun:
+					if o.headID in self.nouns:
+						raw_input("othernoun:"+self.nouns[o.headID])
+					else:
+						self.nouns[o.headID] = o
+
+
 				#for t in target: print(t)
 				if len(source)==0 and len(target)>0:
 					for t in target:
 						triplet = ("-",t,verb,othernoun)
 						self.metadata['triplets'].append(triplet)
+						#self.triplet["-#"+str(t.headID)+"#"]
 				elif len(source)>0 and len(target)==0:
 					for s in source:
 						triplet = (s,"-",verb,othernoun)
@@ -345,4 +557,364 @@ class Sentence:
 				self.metadata['nouns'].extend(source)
 				self.metadata['nouns'].extend(target)
 				self.metadata['nouns'].extend(othernoun)
+
+
+	def get_verb_code(self):
+		logger = logging.getLogger('petr_log.PETRgraph')
+
+		def match_phrase(path, noun_phrase):
+			# Having matched the head of the phrase, this matches the full noun
+			# phrase, if specified
+			logger.debug("mphrase-entry")
+			if not noun_phrase:
+				return False
+			for npID in filter(lambda a: a<noun_phrase.headID,noun_phrase.npIDs):				
+				nptoken = self.udgraph.node[npID]['token'].upper()
+				logger.debug(str(npID)+" "+nptoken)
+				if nptoken in path:
+					subpath = path[nptoken]
+					match = reroute(subpath, lambda a: match_phrase(a, None))
+					if match:
+						return match
+			return reroute(path, lambda a: match_phrase(a, noun_phrase))
+
+		def match_noun(path, noun_phrase):
+			logger.debug("mn-entry")
+			
+			if not isinstance(noun_phrase,basestring):
+				logger.debug("noun:"+noun_phrase.head+"#"+noun_phrase.text)
+				head = noun_phrase.head.upper()
+				if head in path:
+					subpath = path[head]
+					logger.debug(head +" found in pattern dictionary")
+					match = reroute(subpath, (lambda a: match_phrase(a, noun_phrase)) if isinstance(noun_phrase, NounPhrase) else None)
+					if match:
+						logger.debug(match)
+						return match
+
+		def match_prep(path, prep_phrase):
+			print("mp-entry")
+
+
+		def reroute(subpath, o1=match_noun, o2=match_noun,o3=match_prep, o4=match_noun, exit=1):
+			#print('rr-entry:') # ,subpath
+			if not o1:  # match_noun() can call reroute() with o1 == None; guessing returning False is the appropriate response pas 16.04.21
+				return False
+			if '-' in subpath:
+				match = o1(subpath['-'])
+				if match:
+					#print('rr-- match')
+					#print(match)
+					return match
+
+			if ',' in subpath:
+				#print('rr-,')
+				print(subpath[','])
+				#match = o2(subpath[','])
+				#if match:
+					#print(match)
+					#return match
+
+			if '|' in subpath:
+				#print('rr-|')
+				print(subpath['|'])
+				#match = o3(subpath['|'])
+				#if match:
+				#    print(match)
+				#    return match
+
+			if '*' in subpath:
+				#print('rr-*')
+				print(subpath['*'])
+				#return subpath['*']
+				#match = o4(subpath['*'])
+				#if match:
+				#	print(match)
+				#	return match
+
+			if '#' in subpath and exit:
+				#print('rr-#')
+				#print(subpath['#'])
+				return subpath['#']
+
+			#print('rr-False')
+			return False
+
+
+
+		for triple in self.metadata['triplets']:
+			source = triple[0]
+			target = triple[1]
+			verb = triple[2]
+
+			'''get code from verb dictionary'''
+			logger.debug("finding code of verb:"+verb.text)					
+			verbDictionary = PETRglobals.VerbDict['verbs']
+			verbDictPath = verbDictionary
+			code = None
+			meaning = None
+			matched_txt = []
+			for verbtext in verb.text.upper().split(" "):
+				if verbtext in verbDictPath:
+					matched_txt.append(verbtext)
+					verbDictPath = verbDictPath[verbtext]
+
+			if "#" in verbDictPath:
+				try:
+					code = verbDictPath['#']['#']['code']
+					meaning = verbDictPath['#']['#']['meaning']
+				except:
+					print("passing:"+verb.text)
+					pass
+
+					
+			if code != None and meaning != None:	
+				logger.debug(code+"\t"+meaning+"\t"+verb.text+"\t"+(" ").join(matched_txt))
+			else:
+				logger.debug("None code and none meaning")
+			
+
+			'''get code from pattern dictionary'''
+			patternDictionary = PETRglobals.VerbDict['phrases']
+			patternDictPath = patternDictionary
+			matched_pattern = None
+			if meaning in patternDictionary:
+				patternDictPath = patternDictPath[meaning]
+				logger.debug("processing source:")
+				match = match_noun(patternDictPath,source)
+				if match:
+					code = match['code']
+					matched_pattern = match['line']
+					logger.debug("matched:"+code+"\t"+matched_pattern)
+
+				if '*' in patternDictPath:
+					patternDictPath = patternDictPath['*']
+
+				logger.debug("processing target:")
+				match = match_noun(patternDictPath,target)
+				if match:
+					code = match['code']
+					matched_pattern = match['line']
+					logger.debug("matched:"+code+"\t"+matched_pattern)
+
+			tripleID = ('-' if isinstance(source,basestring) else str(source.headID)) + '#' + \
+			           ('-' if isinstance(target,basestring) else str(target.headID)) + '#' + \
+			           str(verb.headID)
+
+			self.triplets[tripleID] = {}   
+			self.triplets[tripleID]['triple']=triple
+			self.triplets[tripleID]['verbcode'] = code
+			self.triplets[tripleID]['matched_txt'] = matched_pattern if matched_pattern != None else (" ").join(matched_txt)
+			self.triplets[tripleID]['meaning'] = meaning
+
+			#raw_input("Press Enter to continue...")
+	
+	def get_events(self):
+		logger = logging.getLogger('petr_log.PETRgraph')
+		self.get_phrases()
+		self.get_verb_code()
+		self.get_rootNode()
+
+		root_event = None
+		root_eventID=""
+		events = {}
+
+		for tripleID, triple in self.triplets.items():
+			logger.debug("check event:"+tripleID)
+			source = triple['triple'][0]
+			source_meaning=""
+			if not isinstance(source,basestring):
+				source.get_meaning() 
+				source_meaning=source.meaning if source.meaning != None else ""
+				logger.debug("source: "+ source.head+" code: "+(("#").join(source.meaning) if source.meaning != None else '-'))
+
+			target = triple['triple'][1]
+			target_meaning=""
+			if not isinstance(target,basestring):
+				target.get_meaning() 
+				target_meaning=target.meaning if target.meaning != None else ""
+				logger.debug("target: "+ target.head+" code: "+(("#").join(target.meaning) if target.meaning != None else '-'))
+
+			verb = triple['triple'][2]
+
+			if(verb.headID == self.rootID):
+				root_event = (source_meaning,target_meaning,triple['verbcode'])
+				root_eventID = tripleID
+				logger.debug("Root verb:"+verb.text+" code:"+(triple['verbcode'] if triple['verbcode'] != None else "-"))
+			else:
+				logger.debug("verb:"+verb.text+" code:"+(triple['verbcode'] if triple['verbcode'] != None else "-"))
+				if verb.headID in self.udgraph.neighbors(self.rootID):
+					relation_with_root = self.udgraph[self.rootID][verb.headID]['relation']
+					logger.debug("verb:"+verb.text+" relation:"+relation_with_root)
+
+			event = (source_meaning,target_meaning,triple['verbcode'])
+			logger.debug(event)
+
+			events[tripleID]= event
+			triple['event'] = event
+
+
+		logger.debug("event transformation....")
+
+		if root_event == None:
+			logger.debug("root_event is None")
+			return {}
+
+		for tripleID, triple in self.triplets.items():
+			verb = triple['triple'][2]
+
+			if verb.headID in self.udgraph.neighbors(self.rootID):
+					relation_with_root = self.udgraph[self.rootID][verb.headID]['relation']
+					if relation_with_root in ['advcl','ccomp','xcomp']:
+						current_event = (source_meaning,target_meaning,triple['verbcode'])
+						event_before_transfer = (root_event[0],current_event,root_event[2])
+						event_after_transfer = self.match_transform(event_before_transfer)
+						logger.debug("event"+tripleID+"transformation:")
+						logger.debug(event_after_transfer)
+						for e in event_after_transfer:
+							if isinstance(e,tuple) and not isinstance(e[1],tuple):
+								if tripleID not in self.events:
+									self.events[tripleID] = []
+								self.events[tripleID].append(e)
+
+		if(len(self.events)==0):
+			self.events[root_eventID]=[]
+			self.events[root_eventID].append(root_event)
+
+		return self.events
+			
+
+
+	def match_transform(self, e):
+		"""
+		Check to see if the event e follows one of the verb transformation patterns
+		specified at the bottom of the Verb Dictionary file.
+
+		If the transformation is present, adjust the event accordingly.
+		If no transformation is present, check if the event is of the form:
+
+		            a ( b . Q ) P , where Q is not a top-level verb.
+
+		    and then convert this to ( a b P+Q )
+
+		Otherwise, return the event as-is.
+
+		Parameters
+		-----------
+		e: tuple
+		   Event to be transformed
+
+		Returns
+		-------
+		t: list of tuples, matched_transformation if exist
+		   List of modified events, since multiple events can come from one single event
+		"""
+
+		logger = logging.getLogger('petr_log.PETRgraph')
+
+		def recurse(pdict, event, a2v={}, v2a={}):
+			'''
+			Parameters
+			-----------
+			a2v: dictionary
+				 actor to variable mapping
+
+			v2a: dictionary
+				 variable to actor mapping
+
+			'''
+			logger.debug("recurse entry..")
+            
+			path = pdict
+			if isinstance(pdict, list):
+				#transfromation pattern is found
+				line = pdict[1]
+				path = pdict[0]
+				verb = utilities.convert_code(path[2])[0] if not path[2] == "Q" else v2a["Q"]
+				if isinstance(v2a[path[1]], tuple):
+					results = []
+					for item in v2a[path[1]]:
+						results.append((list(v2a[path[0]]), item, verb))
+					return results, line
+				return [(list(v2a[path[0]]), v2a[path[1]], verb)], line
+
+			if isinstance(event, tuple):
+				actor = None if not event[0] else tuple(event[0])
+				masks = filter(lambda a: a in pdict, [event[2], event[2] - event[2] % 0x10,
+				                                      event[2] - event[2] % 0x100, event[2] - event[2] % 0x1000])
+				logger.debug("actor:")
+				logger.debug(actor)
+
+				logger.debug("masks:")
+				logger.debug(masks)
+
+				if masks:
+					path = pdict[masks[0]]
+				elif -1 in pdict:
+					v2a["Q"] = event[2]
+					path = pdict[-1]
+				else:
+				    return False
+			else:
+				actor = event
+
+			if actor in a2v:
+				actor = a2v[actor]
+
+			if not actor:
+				actor = "_"
+
+			if actor in path:
+				return recurse(path[actor], event[1], a2v, v2a)
+			elif not actor == '_':
+				for var in sorted(path.keys())[::-1]:
+					if var in v2a:
+						continue
+					if not var == '.':
+						v2a[var] = actor
+						a2v[actor] = var
+					return recurse(path[var], event[1], a2v, v2a)
+			return False
+
+		logger.debug("match_transform entry...")
+
+		try:            
+			logger.debug(e)
+
+			t = recurse(PETRglobals.VerbDict['transformations'], e)
+			if t:
+				logger.debug("transformation is present:")
+				logger.debug("t:")
+				logger.debug(t)
+				return t
+			else:
+				logger.debug("no transformation is present:")
+				if e[0] and e[2] and isinstance(e[1], tuple) and e[1][0] and not e[1][2] / (16 ** 3):
+					logger.debug("the event is of the form: a ( b . Q ) P")
+					if isinstance(e[1][0], list):
+						results = []
+						for item in e[1][0]:
+							event = (e[0], item, utilities.combine_code(e[1][2], e[2]))
+							logger.debug(event)
+							results.append(event)
+						return results
+					
+					event = (e[0], e[1][0], utilities.combine_code(e[2], e[1][2]))
+					logger.debug(event)
+					return [event]
+
+		except Exception as ex:
+			pass  # print(ex)
+		return [e]
+
+
+
+
+
+
+
+
+
+
+
 
